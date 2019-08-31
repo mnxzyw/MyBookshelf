@@ -8,3 +8,7 @@
 /app/release/
 google-services.json
 
+src/androidTest/
+/back
+/tool/书源整理工具/bin/*.exe
+/tool/书源整理工具/*.otares

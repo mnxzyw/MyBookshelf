@@ -5,19 +5,19 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
 import android.webkit.CookieManager;
-import android.webkit.JavascriptInterface;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
+import com.kunfei.bookshelf.DbHelper;
 import com.kunfei.bookshelf.MApplication;
 import com.kunfei.bookshelf.bean.CookieBean;
-import com.kunfei.bookshelf.dao.DbHelper;
 import com.kunfei.bookshelf.help.EncodeConverter;
-import com.kunfei.bookshelf.help.HttpInterceptor;
 import com.kunfei.bookshelf.help.SSLSocketClient;
 import com.kunfei.bookshelf.model.analyzeRule.AnalyzeUrl;
 import com.kunfei.bookshelf.model.impl.IHttpGetApi;
 import com.kunfei.bookshelf.model.impl.IHttpPostApi;
+
+import org.apache.commons.lang3.StringEscapeUtils;
 
 import java.util.Collections;
 import java.util.concurrent.TimeUnit;
@@ -43,19 +43,19 @@ public class BaseModelImpl {
             case POST:
                 return getRetrofitString(analyzeUrl.getHost())
                         .create(IHttpPostApi.class)
-                        .searchBook(analyzeUrl.getPath(),
+                        .postMap(analyzeUrl.getPath(),
                                 analyzeUrl.getQueryMap(),
                                 analyzeUrl.getHeaderMap());
             case GET:
                 return getRetrofitString(analyzeUrl.getHost())
                         .create(IHttpGetApi.class)
-                        .searchBook(analyzeUrl.getPath(),
+                        .getMap(analyzeUrl.getPath(),
                                 analyzeUrl.getQueryMap(),
                                 analyzeUrl.getHeaderMap());
             default:
                 return getRetrofitString(analyzeUrl.getHost())
                         .create(IHttpGetApi.class)
-                        .getWebContent(analyzeUrl.getPath(),
+                        .get(analyzeUrl.getPath(),
                                 analyzeUrl.getHeaderMap());
         }
     }
@@ -90,8 +90,7 @@ public class BaseModelImpl {
                     .sslSocketFactory(SSLSocketClient.getSSLSocketFactory(), SSLSocketClient.createTrustAllManager())
                     .hostnameVerifier(SSLSocketClient.getHostnameVerifier())
                     .protocols(Collections.singletonList(Protocol.HTTP_1_1))
-                    .addInterceptor(getHeaderInterceptor())
-                    .addInterceptor(new HttpInterceptor(1));
+                    .addInterceptor(getHeaderInterceptor());
         }
         return clientBuilder;
     }
@@ -131,43 +130,73 @@ public class BaseModelImpl {
     }
 
     @SuppressLint({"AddJavascriptInterface", "SetJavaScriptEnabled"})
-    protected Observable<String> getAjaxHtml(AnalyzeUrl analyzeUrl, String sourceUrl) {
+    protected Observable<String> getAjaxString(AnalyzeUrl analyzeUrl, String tag, String js) {
+        final Web web = new Web("加载超时");
+        if (!TextUtils.isEmpty(js)) {
+            web.js = js;
+        }
         return Observable.create(e -> {
             Handler handler = new Handler(Looper.getMainLooper());
             handler.post(() -> {
-                class HtmlOutJavaScriptInterface {
-
-                    @SuppressWarnings("unused")
-                    @JavascriptInterface
-                    public void processHTML(String html) {
-                        e.onNext(html);
-                        e.onComplete();
-                    }
-                }
+                Runnable timeoutRunnable;
                 WebView webView = new WebView(MApplication.getInstance());
                 webView.getSettings().setJavaScriptEnabled(true);
                 webView.getSettings().setUserAgentString(analyzeUrl.getHeaderMap().get("User-Agent"));
-                webView.addJavascriptInterface(new HtmlOutJavaScriptInterface(), "HTML_OUT");
                 CookieManager cookieManager = CookieManager.getInstance();
+                Runnable retryRunnable = new Runnable() {
+                    @Override
+                    public void run() {
+                        webView.evaluateJavascript(web.js, value -> {
+                            if (!TextUtils.isEmpty(value)) {
+                                web.content = StringEscapeUtils.unescapeJson(value);
+                                e.onNext(web.content);
+                                e.onComplete();
+                                webView.destroy();
+                                handler.removeCallbacks(this);
+                            } else {
+                                handler.postDelayed(this, 1000);
+                            }
+                        });
+                    }
+                };
+                timeoutRunnable = () -> {
+                    if (!e.isDisposed()) {
+                        handler.removeCallbacks(retryRunnable);
+                        e.onNext(web.content);
+                        e.onComplete();
+                        webView.destroy();
+                    }
+                };
+                handler.postDelayed(timeoutRunnable, 30000);
                 webView.setWebViewClient(new WebViewClient() {
                     @Override
                     public void onPageFinished(WebView view, String url) {
-                        DbHelper.getDaoSession().getCookieBeanDao().insertOrReplace(new CookieBean(sourceUrl, cookieManager.getCookie(webView.getUrl())));
-                        webView.loadUrl("javascript:window.HTML_OUT.processHTML('<head>'+document.getElementsByTagName('html')[0].innerHTML+'</head>');");
+                        DbHelper.getDaoSession().getCookieBeanDao()
+                                .insertOrReplace(new CookieBean(tag, cookieManager.getCookie(webView.getUrl())));
+                        handler.postDelayed(retryRunnable, 1000);
                     }
                 });
                 switch (analyzeUrl.getUrlMode()) {
                     case POST:
-                        webView.postUrl(analyzeUrl.getUrl(), analyzeUrl.getQueryStr().getBytes());
+                        webView.postUrl(analyzeUrl.getUrl(), analyzeUrl.getPostData());
                         break;
                     case GET:
-                        webView.loadUrl(String.format("%s?%s", analyzeUrl.getUrl(), analyzeUrl.getQueryStr()));
+                        webView.loadUrl(String.format("%s?%s", analyzeUrl.getUrl(), analyzeUrl.getQueryStr()), analyzeUrl.getHeaderMap());
                         break;
                     default:
-                        webView.loadUrl(analyzeUrl.getUrl());
+                        webView.loadUrl(analyzeUrl.getUrl(), analyzeUrl.getHeaderMap());
                 }
             });
         });
+    }
+
+    private class Web {
+        private String content;
+        private String js = "document.documentElement.outerHTML";
+
+        Web(String content) {
+            this.content = content;
+        }
     }
 
 }
